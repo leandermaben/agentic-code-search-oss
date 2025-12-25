@@ -2329,3 +2329,714 @@ You now have a comprehensive understanding of the **Agentic Code Search OSS** pr
 - **vLLM**: https://docs.vllm.ai/
 
 **Happy experimenting!**
+
+---
+
+## 16. NEW FEATURE: Experiment Configuration System
+
+### Overview
+
+The repository now includes a powerful **experiment configuration system** that allows you to define complete experiments using YAML files. This makes it much easier to run different experimental setups without modifying code.
+
+**Location:** `configs/skyrl-experiments/`
+
+### What's New
+
+**Before:**
+```bash
+# Had to modify Python code or use many command-line overrides
+uv run src/train.py \
+    generator.reward=configs/rewards/tool_use.yaml \
+    trainer.policy.model.path=Qwen/Qwen3-4B \
+    # ... 20+ more parameters
+```
+
+**After:**
+```bash
+# Single experiment config file
+bash scripts/run_async_training.sh \
+    -m Qwen/Qwen3-4B \
+    -o "+generator.exp_config=configs/skyrl-experiments/terminal.yaml" \
+    -d $DATA_PATH
+```
+
+### Experiment Config Structure
+
+**Location:** `configs/skyrl-experiments/terminal.yaml`
+
+```yaml
+name: "terminal_tool_only"
+description: "The agent only has access to the terminal tool"
+
+reward:
+  - fn: tool_use_reward
+  - fn: turn_efficiency
+
+tools:
+  - terminal
+
+prompts:
+  system_prompt: "templates/system_prompt.j2"
+  user_prompt: "templates/file_localization.j2"
+```
+
+### Configuration Fields
+
+#### 1. `name` (optional)
+- Unique identifier for the experiment
+- Used for logging and tracking
+
+#### 2. `description` (optional)
+- Human-readable description
+- Documents what the experiment tests
+
+#### 3. `reward` (required)
+- List of reward functions to use
+- Same format as `configs/rewards/*.yaml`
+- Functions looked up in reward registry
+
+#### 4. `tools` (required) - **NEW!**
+- List of tools available to the agent
+- Can include:
+  - Built-in OpenHands tools
+  - Custom tools (via tool registry)
+  - Tool sets (multiple tools bundled together)
+
+**Available Built-in Tools:**
+```yaml
+tools:
+  - terminal      # Execute shell commands
+  - glob          # Search files by pattern
+  - grep          # Search file contents
+  - file_editor   # Edit files
+  - apply_patch   # Apply code patches
+  - task_tracker  # Track tasks
+  - browser_use   # Web browser interaction
+  - delegate      # Delegate to sub-agents
+```
+
+#### 5. `prompts` (required) - **NEW!**
+- Specify system and user prompt templates
+- Uses Jinja2 templates from `src/prompts/templates/`
+- Allows different prompts for different experiments
+
+**Available Templates:**
+- `system_prompt.j2` - Default system prompt
+- `file_localization.j2` - File localization user prompt
+- `file_module.j2` - File/module user prompt
+- `file_module_parallel_tools.j2` - Parallel tool usage prompt
+- `system_message_search.j2` - Search task system prompt
+
+### Example Experiment Configs
+
+#### Example 1: Terminal Only
+
+**File:** `configs/skyrl-experiments/terminal.yaml`
+
+```yaml
+name: "terminal_tool_only"
+description: "The agent only has access to the terminal tool"
+
+reward:
+  - fn: tool_use_reward
+  - fn: turn_efficiency
+
+tools:
+  - terminal
+
+prompts:
+  system_prompt: "templates/system_prompt.j2"
+  user_prompt: "templates/file_localization.j2"
+```
+
+**What it tests:**
+- Can agent effectively use only terminal for all operations?
+- Forces agent to use bash commands (rg, grep, find, etc.)
+
+#### Example 2: Read-Only Tools
+
+**File:** `configs/skyrl-experiments/read-only.yaml`
+
+```yaml
+name: "read_only_tools"
+description: "The agent only has access to read only tools"
+
+reward:
+  - fn: tool_use_reward
+  - fn: turn_efficiency
+
+tools:
+  - glob
+  - grep
+  - terminal
+
+prompts:
+  system_prompt: "templates/system_prompt.j2"
+  user_prompt: "templates/file_localization.j2"
+```
+
+**What it tests:**
+- Provides specialized search tools (glob, grep) in addition to terminal
+- Tests if specialized tools improve performance
+
+### Running Experiments
+
+**Basic Usage:**
+
+```bash
+DATA_PATH=/path/to/data
+
+bash scripts/run_async_training.sh \
+    -m Qwen/Qwen3-4B \
+    -o "+generator.exp_config=configs/skyrl-experiments/terminal.yaml" \
+    -d $DATA_PATH \
+    2>&1 | tee training.log
+```
+
+**Parameters:**
+- `-m MODEL` - Model to train (e.g., Qwen/Qwen3-4B)
+- `-o OPTIONS` - Additional Hydra overrides
+  - `+generator.exp_config=...` - Path to experiment config
+- `-d DATA_PATH` - Absolute path to dataset directory
+
+**Without Experiment Config (Legacy):**
+
+```bash
+bash scripts/run_async_training.sh \
+    -m Qwen/Qwen3-4B \
+    -d $DATA_PATH
+```
+
+---
+
+## 17. NEW FEATURE: Tool Registry System
+
+### Overview
+
+Similar to the reward registry, there's now a **tool registry** for creating and registering custom tools.
+
+**Location:** `src/tools/__init__.py`
+
+### Tool Registry Pattern
+
+```python
+from src.tools import tool
+
+TOOL_REGISTRY = {}
+
+def tool(name: str):
+    """Decorator to register a tool."""
+    def decorator(func):
+        TOOL_REGISTRY[name] = func
+        return func
+    return decorator
+
+def get_tool_by_name(name: str):
+    """Get tool by name from registry."""
+    if name not in TOOL_REGISTRY:
+        raise ValueError(f"Tool '{name}' not found")
+    return TOOL_REGISTRY[name]
+```
+
+### Creating Custom Tools
+
+**Full Example:** `src/tools/example_custom_tool.py`
+
+#### Step 1: Define Action Class
+
+```python
+from pydantic import Field
+from openhands.sdk import Action
+
+class GrepAction(Action):
+    """Action for grep tool."""
+    pattern: str = Field(description="Regex to search for")
+    path: str = Field(default=".", description="Directory to search")
+    include: str | None = Field(default=None, description="Glob to filter files")
+```
+
+#### Step 2: Define Observation Class
+
+```python
+from openhands.sdk import Observation, TextContent
+
+class GrepObservation(Observation):
+    """Observation returned by grep tool."""
+    matches: list[str] = Field(default_factory=list)
+    files: list[str] = Field(default_factory=list)
+    count: int = 0
+
+    @property
+    def to_llm_content(self) -> Sequence[TextContent]:
+        """Format observation for LLM."""
+        if not self.count:
+            return [TextContent(text="No matches found.")]
+        
+        files_list = "\n".join(f"- {f}" for f in self.files[:20])
+        sample = "\n".join(self.matches[:10])
+        
+        return [TextContent(text=f"Found {self.count} matches\nFiles:\n{files_list}\nSample:\n{sample}")]
+```
+
+#### Step 3: Define Executor
+
+```python
+from openhands.sdk.tool import ToolExecutor
+
+class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
+    """Executor that performs grep operation."""
+    
+    def __init__(self, terminal: TerminalExecutor):
+        self.terminal = terminal
+
+    def __call__(self, action: GrepAction, conversation=None) -> GrepObservation:
+        # Build grep command
+        cmd = f"grep -rHnE {action.pattern} {action.path}"
+        
+        # Execute via terminal
+        result = self.terminal(TerminalAction(command=cmd))
+        
+        # Parse results
+        matches = result.text.split('\n')
+        files = set(m.split(':')[0] for m in matches if m)
+        
+        return GrepObservation(
+            matches=matches,
+            files=list(files),
+            count=len(matches)
+        )
+```
+
+#### Step 4: Define Tool
+
+```python
+from openhands.sdk import ToolDefinition
+
+class GrepTool(ToolDefinition[GrepAction, GrepObservation]):
+    """Tool definition for grep."""
+    
+    @classmethod
+    def create(cls, conv_state) -> Sequence[ToolDefinition]:
+        terminal_executor = TerminalExecutor(working_dir=conv_state.workspace.working_dir)
+        grep_executor = GrepExecutor(terminal=terminal_executor)
+        
+        return [
+            cls(
+                description="Search for patterns in files using regex",
+                action_type=GrepAction,
+                observation_type=GrepObservation,
+                executor=grep_executor,
+            )
+        ]
+```
+
+#### Step 5: Register Tool
+
+```python
+from src.tools import tool
+
+@tool(name="grep")
+def _make_grep_tool(conv_state) -> list[ToolDefinition]:
+    """Register grep tool."""
+    return GrepTool.create(conv_state)
+```
+
+#### Step 6: Use in Experiment Config
+
+```yaml
+tools:
+  - grep
+  - terminal
+```
+
+### Creating Toolsets
+
+Toolsets bundle multiple tools that share resources:
+
+```python
+@tool(name="bash_and_grep_toolset")
+def _make_bash_and_grep_toolset(conv_state) -> list[ToolDefinition]:
+    """Create bash and grep tools with shared terminal executor."""
+    
+    # Shared executor
+    terminal_executor = TerminalExecutor(working_dir=conv_state.workspace.working_dir)
+    
+    # Create bash tool
+    bash_tool = BashTool.create(conv_state, executor=terminal_executor)[0]
+    
+    # Create grep tool with same executor
+    grep_executor = GrepExecutor(terminal=terminal_executor)
+    grep_tool = GrepTool(
+        description="Search files with grep",
+        action_type=GrepAction,
+        observation_type=GrepObservation,
+        executor=grep_executor,
+    )
+    
+    return [bash_tool, grep_tool]
+```
+
+**Usage:**
+
+```yaml
+tools:
+  - bash_and_grep_toolset  # Provides both bash and grep
+```
+
+### Default Tools Available
+
+**From OpenHands SDK:**
+
+| Tool | Description | Usage |
+|------|-------------|-------|
+| `terminal` | Execute shell commands | General bash operations |
+| `glob` | Search files by pattern | Find files matching `*.py` |
+| `grep` | Search file contents | Find code patterns |
+| `file_editor` | Edit files | Modify file contents |
+| `apply_patch` | Apply patches | Apply git patches |
+| `task_tracker` | Track tasks | Manage TODO items |
+| `browser_use` | Web browser | Browse websites |
+| `delegate` | Sub-agents | Delegate to specialized agents |
+
+### Tool Development Best Practices
+
+1. **Keep executors focused** - One tool, one responsibility
+2. **Share resources** - Use toolsets when tools share executors
+3. **Format observations clearly** - Make LLM-friendly output
+4. **Handle errors gracefully** - Return meaningful error observations
+5. **Document parameters** - Use Pydantic Field descriptions
+
+---
+
+## 18. NEW FEATURE: Trajectory Analysis
+
+### Overview
+
+A new script for analyzing training trajectories has been added to help you understand agent behavior and debug issues.
+
+**Location:** `scripts/analyze_trajectories.py`
+
+### What It Does
+
+- **Analyzes trajectory JSON files** from training runs
+- **Counts message types** (TokenEvent, ActionEvent, etc.)
+- **Extracts final responses** from agents
+- **Computes statistics** across all trajectories
+- **Exports to CSV** for easy analysis
+
+### Usage
+
+```bash
+# Analyze trajectories
+uv run scripts/analyze_trajectories.py
+
+# Output: trajectory_analysis.csv
+```
+
+**Default Trajectory Location:**
+```
+ckpts/{model}/trajectories/
+├── step_10/
+│   ├── train/
+│   │   ├── instance1_0.json
+│   │   ├── instance2_0.json
+│   │   └── ...
+│   └── eval/
+│       └── ...
+├── step_20/
+└── ...
+```
+
+### Output Format
+
+**CSV Columns:**
+
+| Column | Description |
+|--------|-------------|
+| `step` | Training step number |
+| `phase` | "train" or "eval" |
+| `instance_id` | SWE-bench instance ID |
+| `repetition` | Rollout repetition number |
+| `num_messages` | Total messages in trajectory |
+| `TokenEvent` | Count of token events |
+| `ActionEvent` | Count of action events |
+| `ObservationEvent` | Count of observation events |
+| `MessageEvent` | Count of message events |
+| `total_reward` | Sum of all rewards |
+| `final_message` | Agent's final response (truncated) |
+
+### Example Analysis
+
+```python
+import pandas as pd
+
+# Load trajectory analysis
+df = pd.read_csv('trajectory_analysis.csv')
+
+# Average tool calls per step
+print(df.groupby('step')['ActionEvent'].mean())
+
+# Success rate (has final response)
+df['has_response'] = df['final_message'].str.len() > 0
+print(df.groupby('step')['has_response'].mean())
+
+# Reward progression
+print(df.groupby('step')['total_reward'].describe())
+```
+
+### Custom Analysis
+
+**Modify the script:**
+
+```python
+# scripts/analyze_trajectories.py
+
+def analyze_trajectory(filepath: Path) -> dict:
+    with open(filepath, 'r') as f:
+        data = json.load(f)
+    
+    # Add custom metrics
+    messages = data.get('messages', [])
+    
+    # Example: Count parallel tool calls
+    max_parallel_tools = 0
+    for msg in messages:
+        if msg.get('kind') == 'ActionEvent':
+            # Count simultaneous tool calls
+            # (you'd need to track timing)
+            pass
+    
+    return {
+        'max_parallel_tools': max_parallel_tools,
+        # ... other metrics
+    }
+```
+
+### Common Analysis Tasks
+
+**1. Find Failed Trajectories:**
+```bash
+# Trajectories with zero reward
+cat trajectory_analysis.csv | awk -F',' '$NF == 0 {print $1,$3}'
+```
+
+**2. Compare Tools Across Steps:**
+```python
+df.pivot_table(
+    index='step',
+    columns='phase',
+    values='ActionEvent',
+    aggfunc='mean'
+)
+```
+
+**3. Identify High-Performing Instances:**
+```python
+top_instances = df.nlargest(10, 'total_reward')[['instance_id', 'total_reward']]
+```
+
+---
+
+## 19. Updated: Complete Workflow with New Features
+
+### Updated Training Workflow
+
+**Step 1: Create Experiment Config**
+
+```bash
+# Create new experiment config
+cat > configs/skyrl-experiments/my_experiment.yaml << 'EOF'
+name: "custom_experiment"
+description: "Testing custom tool combination"
+
+reward:
+  - fn: tool_use_reward
+  - fn: turn_efficiency
+  - fn: multilevel_localization_f1_reward
+
+tools:
+  - terminal
+  - grep
+  - glob
+
+prompts:
+  system_prompt: "templates/system_prompt.j2"
+  user_prompt: "templates/file_localization.j2"
+EOF
+```
+
+**Step 2: (Optional) Create Custom Tool**
+
+```bash
+# If using custom tools, create them first
+# See src/tools/example_custom_tool.py for template
+```
+
+**Step 3: Run Training**
+
+```bash
+DATA_PATH=/path/to/data
+
+bash scripts/run_async_training.sh \
+    -m Qwen/Qwen3-4B \
+    -o "+generator.exp_config=configs/skyrl-experiments/my_experiment.yaml" \
+    -d $DATA_PATH \
+    2>&1 | tee logs/my_experiment.log
+```
+
+**Step 4: Monitor Training**
+
+```bash
+# Watch W&B dashboard
+# OR check local logs
+tail -f logs/my_experiment.log
+
+# Check trajectory files
+ls -lh ckpts/Qwen-Qwen3-4B/trajectories/step_10/train/
+```
+
+**Step 5: Analyze Trajectories**
+
+```bash
+# Run analysis
+uv run scripts/analyze_trajectories.py
+
+# View results
+import pandas as pd
+df = pd.read_csv('trajectory_analysis.csv')
+print(df.groupby('step')['total_reward'].describe())
+```
+
+**Step 6: Iterate**
+
+```bash
+# Modify experiment config based on analysis
+# Try different tools, rewards, or prompts
+# Re-run training
+```
+
+---
+
+## 20. Updated: Quick Reference
+
+### Running Training (Updated)
+
+```bash
+# With experiment config (recommended)
+bash scripts/run_async_training.sh \
+    -m Qwen/Qwen3-4B \
+    -o "+generator.exp_config=configs/skyrl-experiments/terminal.yaml" \
+    -d /path/to/data
+
+# Legacy (without experiment config)
+bash scripts/run_async_training.sh \
+    -m Qwen/Qwen3-4B \
+    -d /path/to/data
+```
+
+### Creating Experiments
+
+```yaml
+# configs/skyrl-experiments/my_exp.yaml
+name: "my_experiment"
+description: "What this tests"
+
+reward:
+  - fn: reward_function_name
+
+tools:
+  - tool_name_1
+  - tool_name_2
+
+prompts:
+  system_prompt: "templates/system_prompt.j2"
+  user_prompt: "templates/file_localization.j2"
+```
+
+### Creating Custom Tools
+
+```python
+# src/tools/my_tool.py
+from src.tools import tool
+from openhands.sdk import Action, Observation, ToolDefinition
+
+# 1. Define Action
+class MyAction(Action):
+    param: str = Field(...)
+
+# 2. Define Observation  
+class MyObservation(Observation):
+    result: str = ""
+
+# 3. Define Executor
+class MyExecutor(ToolExecutor[MyAction, MyObservation]):
+    def __call__(self, action, conversation=None):
+        return MyObservation(result="...")
+
+# 4. Define Tool
+class MyTool(ToolDefinition[MyAction, MyObservation]):
+    @classmethod
+    def create(cls, conv_state):
+        return [cls(
+            description="...",
+            action_type=MyAction,
+            observation_type=MyObservation,
+            executor=MyExecutor(),
+        )]
+
+# 5. Register
+@tool(name="my_tool")
+def _make_my_tool(conv_state):
+    return MyTool.create(conv_state)
+```
+
+### Analyzing Trajectories
+
+```bash
+# Run analysis
+uv run scripts/analyze_trajectories.py
+
+# View CSV
+head trajectory_analysis.csv
+
+# Custom analysis with pandas
+python << 'EOF'
+import pandas as pd
+df = pd.read_csv('trajectory_analysis.csv')
+print(df.describe())
+EOF
+```
+
+---
+
+## Summary of New Features
+
+The latest updates add three major capabilities:
+
+1. **Experiment Configuration System**
+   - Define complete experiments in YAML
+   - Specify tools, rewards, and prompts
+   - Easy to run different experimental setups
+   - Location: `configs/skyrl-experiments/`
+
+2. **Tool Registry & Custom Tools**
+   - Register custom tools like rewards
+   - Create specialized search/analysis tools
+   - Bundle tools into toolsets
+   - Example: `src/tools/example_custom_tool.py`
+
+3. **Trajectory Analysis**
+   - Analyze training trajectories
+   - Extract statistics and metrics
+   - Export to CSV for analysis
+   - Script: `scripts/analyze_trajectories.py`
+
+These features make it **much easier** to:
+- Run experiments with different tool combinations
+- Create custom tools for specific tasks
+- Analyze and debug agent behavior
+- Iterate quickly on experimental ideas
+
+---
+
+**Documentation last updated:** 2025-12-25 (includes all features through latest main branch)
