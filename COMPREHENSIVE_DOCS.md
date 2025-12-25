@@ -356,3 +356,460 @@ dependencies = [
 
 ---
 
+## 6. OpenHands SDK Integration
+
+### What is OpenHands SDK?
+
+The **OpenHands Software Agent SDK** (from https://github.com/OpenHands/software-agent-sdk) is a Python framework for building agents that work with code. It provides:
+
+- **Agent abstraction** - Base class for creating LLM-powered agents
+- **Tool framework** - Define and execute tools (bash, file editor, etc.)
+- **Conversation management** - Handle multi-turn interactions
+- **Workspace isolation** - Safe code execution in containers
+- **Event system** - Track agent actions and responses
+
+### Why Use OpenHands?
+
+Instead of building agent infrastructure from scratch, OpenHands provides:
+- **Pre-built tools** (TerminalTool, FileEditorTool, etc.)
+- **LLM integration** with multiple backends (OpenAI, vLLM, etc.)
+- **Message handling** with proper formatting for tool calls
+- **Security** via sandboxed execution
+
+### How This Project Uses OpenHands
+
+#### 1. Custom Agent Class
+
+**Location:** `src/agent/agent.py`
+
+```python
+from openhands.sdk import Agent
+
+class CustomAgent(Agent):
+    def step(self, conversation, on_event, on_token=None):
+        # Custom logic to handle reasoning models
+        # Extract reasoning from <think> tags
+        if "</think>" in content:
+            reasoning_content = content.split('</think>')[0]...
+            message.reasoning_content = reasoning_content
+
+        # Handle tool calls and execute actions
+        if message.tool_calls and len(message.tool_calls) > 0:
+            for tool_call in message.tool_calls:
+                action_event = self._get_action_event(tool_call, ...)
+                # Execute the tool
+```
+
+**Key Customizations:**
+- **Reasoning extraction** - Qwen3 models can output reasoning in `<think>` tags; this code extracts and separates it
+- **Token tracking** - Captures prompt and response token IDs for RL training
+- **Context window management** - Handles condensation when context limit is reached
+
+#### 2. Agent Creation in Generator
+
+**Location:** `src/generator/code_search_generator.py:107`
+
+```python
+agent = CustomAgent(
+    llm=LLM(
+        usage_id="agent",
+        model="litellm_proxy/willcb/Qwen3-8B",  # Model served by vLLM
+        base_url="http://127.0.0.1:8000/v1/",   # vLLM server
+        api_key="sk-xxx",                        # Dummy key
+        temperature=1.0,                         # High temp for exploration
+        litellm_extra_body={
+            "return_token_ids": True,            # For RL training
+            "include_stop_str_in_output": True,
+        }
+    ),
+    tools=[Tool(name=TerminalTool.name)],       # Only bash tool
+    security_analyzer=None,                      # No security checks (trusted env)
+    system_prompt_filename="prompts/templates/system_prompt.j2"
+)
+```
+
+#### 3. Conversation Management
+
+**Location:** `src/generator/code_search_generator.py:125`
+
+```python
+conversation = Conversation(
+    agent=agent,
+    max_iteration_per_run=10,     # Max 10 turns
+    visualizer=None,              # No UI visualization
+    workspace=str(working_dir),   # Repository path
+)
+
+# Send initial problem statement
+input_message = get_instruction(instance, prompt_template, working_dir)
+conversation.send_message(input_message)
+
+# Run agent until completion
+conversation.run()
+
+# Extract results
+messages = list(map(lambda event: event.model_dump(), conversation.state.events))
+final_message = get_agent_final_response(conversation.state.events)
+```
+
+**Flow:**
+1. Create conversation with agent and workspace
+2. Send user message (problem statement)
+3. Run agent loop (agent generates tool calls → tools execute → agent sees results → repeat)
+4. Extract final response and all events for reward computation
+
+#### 4. Tools Integration
+
+**Location:** `src/tools/bash.py`
+
+```python
+from openhands.tools.terminal import TerminalTool
+
+# In environment setup:
+self.add_tool(tools.bash, args_to_skip=["cwd"])
+
+# The bash tool definition:
+def bash(command: str, cwd: Optional[str] = None) -> str:
+    """Execute bash command in the repository."""
+    # Implementation details...
+```
+
+The OpenHands SDK automatically:
+- Converts Python functions to tool schemas
+- Formats them for LLM tool calling
+- Validates tool call arguments
+- Executes tools and returns results
+
+### Event Types in OpenHands
+
+When you run a conversation, it generates **events**:
+
+```python
+# Sample event stream:
+[
+    {"kind": "MessageEvent", "source": "user", "content": "Find files for bug fix"},
+    {"kind": "TokenEvent", "prompt_token_ids": [...], "response_token_ids": [...]},
+    {"kind": "ActionEvent", "action": "bash", "args": {"command": "rg 'def login'"}},
+    {"kind": "ObservationEvent", "content": "auth/login.py:42:def login(user):"},
+    {"kind": "TokenEvent", ...},
+    {"kind": "ActionEvent", "action": "bash", "args": {"command": "rg 'password reset'"}},
+    {"kind": "MessageEvent", "source": "agent", "content": "<files>auth/login.py\nauth/password.py</files>"},
+]
+```
+
+**Event Types:**
+- **MessageEvent** - User or agent text messages
+- **TokenEvent** - LLM generation with token IDs (for RL)
+- **ActionEvent** - Tool calls from the agent
+- **ObservationEvent** - Tool execution results
+
+### Token Events for RL Training
+
+The key innovation for RL training is **capturing token IDs**:
+
+```python
+# In CustomAgent, when LLM generates a response:
+message = {
+    "kind": "TokenEvent",
+    "prompt_token_ids": [151643, 8948, ...],     # Input tokens
+    "response_token_ids": [151644, 9023, ...],   # Generated tokens
+}
+```
+
+These token IDs are used to compute **log probabilities** for PPO training:
+- **Prompt tokens** → context for generation
+- **Response tokens** → what to optimize (increase prob if reward high, decrease if low)
+
+---
+
+## 7. SkyRL Framework
+
+### What is SkyRL?
+
+**SkyRL** (from https://github.com/NovaSky-AI/SkyRL) is a reinforcement learning framework specifically designed for training **large language models (LLMs)** using **Proximal Policy Optimization (PPO)**.
+
+### Why SkyRL?
+
+Other RL frameworks (like OpenAI's RL toolkit or RLlib) are designed for traditional RL (e.g., game playing, robotics). SkyRL is optimized for:
+- **LLM-specific PPO** - Handles text generation, token-level rewards
+- **Distributed training** - Multi-GPU, multi-node via Ray
+- **Async execution** - Faster than synchronous PPO
+- **Integration with vLLM** - Efficient inference engine
+
+### PPO Overview (Quick Primer)
+
+**PPO (Proximal Policy Optimization)** is an RL algorithm that improves a policy (in this case, the LLM's text generation) by:
+
+1. **Collect trajectories** - Run the current policy (LLM) on tasks
+2. **Compute rewards** - Score how well the policy did
+3. **Update policy** - Adjust model weights to increase probability of high-reward actions
+4. **Repeat** - Iterate to improve
+
+**Key PPO Concepts:**
+- **Policy (π)** - The LLM that generates text (tool calls, responses)
+- **Reward (R)** - Score for a trajectory (e.g., F1 score for file localization)
+- **Value function (V)** - Estimates expected future reward
+- **Advantage (A)** - How much better an action was than expected
+- **Clipped objective** - Prevents too-large policy updates (stability)
+
+### How This Project Uses SkyRL
+
+#### 1. Training Entry Point
+
+**Location:** `src/train.py`
+
+```python
+from skyrl_train.entrypoints.main_base import BasePPOExp
+
+class CodeSearchPPOExp(BasePPOExp):
+    def get_generator(self, cfg, tokenizer, inference_engine_client):
+        # Create custom generator (OpenHands-based)
+        return CodeSearchGenerator(...)
+
+@hydra.main(config_path=config_dir, config_name="ppo_base_config")
+def main(cfg: DictConfig):
+    # Load reward configuration from YAML
+    if hasattr(cfg.generator, "reward"):
+        with open(cfg.generator.reward, "r") as f:
+            reward_cfg = OmegaConf.load(f)
+        cfg.generator.reward = reward_cfg.reward
+
+    # Initialize Ray for distributed training
+    initialize_ray(cfg)
+
+    # Launch training experiment
+    ray.get(skyrl_entrypoint.remote(cfg))
+```
+
+**What `BasePPOExp` Provides:**
+- Dataset loading
+- Tokenizer initialization
+- Inference engine setup (vLLM)
+- Trainer creation (PPO optimizer)
+- Checkpointing
+- Logging
+
+#### 2. Custom Generator
+
+SkyRL expects a **generator** that:
+- Takes prompts (problem statements)
+- Generates completions (agent trajectories)
+- Computes rewards
+- Returns token IDs and rewards for PPO
+
+**Location:** `src/generator/code_search_generator.py`
+
+```python
+from skyrl_train.generators.skyrl_gym_generator import SkyRLGymGenerator
+
+class CodeSearchGenerator(SkyRLGymGenerator):
+    async def generate(self, input_batch: GeneratorInput) -> GeneratorOutput:
+        # For each problem in batch:
+        for i in range(len(prompts)):
+            # 1. Create agent + conversation
+            agent = CustomAgent(llm=...)
+            conversation = Conversation(agent=agent, ...)
+
+            # 2. Run agent on problem
+            conversation.send_message(problem_statement)
+            conversation.run()
+
+            # 3. Extract messages and final response
+            messages = conversation.state.events
+            final_message = get_agent_final_response(messages)
+
+            # 4. Compute reward
+            reward = compute_reward(final_message, ground_truth)
+
+            # 5. Extract token IDs from TokenEvents
+            token_messages = [msg for msg in messages if msg["kind"] == "TokenEvent"]
+            response_ids = [msg["response_token_ids"] for msg in token_messages]
+            prompt_ids = [msg["prompt_token_ids"] for msg in token_messages]
+
+            # 6. Return for PPO training
+            rollout_list.append((response_ids, reward, ...))
+
+        return GeneratorOutput(
+            response_ids=response_ids,
+            rewards=rewards,
+            prompt_token_ids=prompt_ids,
+            ...
+        )
+```
+
+#### 3. Async vs Sync Training
+
+**Synchronous PPO (Default):**
+- Generate batch of trajectories → Wait for all to finish → Update policy → Repeat
+- Simple but slow (blocked waiting for slowest trajectory)
+
+**Asynchronous PPO (Faster):**
+- Generate trajectories continuously in background
+- Update policy as soon as enough data is collected
+- Don't wait for slow trajectories
+
+**Location:** `src/async_trainer.py`
+
+```python
+from skyrl_train.fully_async_trainer import FullyAsyncRayPPOTrainer
+
+class CustomFullyAsyncRayPPOTrainer(FullyAsyncRayPPOTrainer):
+    # Custom async training logic
+    # Overlaps trajectory generation with policy updates
+```
+
+**To enable async training:**
+```yaml
+# In config
+run_async_trainer: true
+```
+
+#### 4. PPO Update Loop
+
+**What SkyRL does behind the scenes:**
+
+```python
+# Simplified PPO loop:
+for epoch in range(num_epochs):
+    # 1. Generate trajectories with current policy
+    rollouts = generator.generate(problems)
+
+    # 2. Compute advantages (how good were actions?)
+    advantages = compute_gae(rewards, values)
+
+    # 3. Multiple optimization epochs on collected data
+    for _ in range(ppo_epochs):
+        # 4. Compute PPO loss
+        # Compare new policy to old policy
+        ratio = π_new(action) / π_old(action)
+        clipped_ratio = clip(ratio, 1-ε, 1+ε)
+        loss = -min(ratio * advantage, clipped_ratio * advantage)
+
+        # 5. Update model weights
+        optimizer.step()
+
+    # 6. Save checkpoint
+    if epoch % checkpoint_interval == 0:
+        save_checkpoint()
+```
+
+---
+
+## 8. Training Pipeline
+
+### End-to-End Training Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. DATASET PREPARATION                                          │
+│    └─ build_dataset.py: Load SWE-bench, extract ground truth   │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. ENVIRONMENT SETUP                                            │
+│    └─ Clone repositories at specific commits                   │
+│    └─ Define tools (bash) and completion criteria              │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 3. TRAINING INITIALIZATION                                      │
+│    ├─ Load config (Hydra)                                      │
+│    ├─ Initialize Ray cluster                                   │
+│    ├─ Start vLLM inference engine                              │
+│    ├─ Load base model (Qwen3-8B) + LoRA adapters              │
+│    └─ Create PPO trainer                                       │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 4. TRAJECTORY GENERATION (Generator)                            │
+│    For each problem:                                            │
+│    ├─ Create agent with LLM                                    │
+│    ├─ Send problem statement                                   │
+│    ├─ Agent generates tool calls (bash commands)               │
+│    ├─ Execute tools in repository                              │
+│    ├─ Agent sees results, generates more calls                 │
+│    └─ Continue until <files> tag or max turns                  │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 5. REWARD COMPUTATION                                           │
+│    ├─ Extract predicted files from agent's final message       │
+│    ├─ Compare to ground truth files (from patch)               │
+│    ├─ Compute F1 score (precision & recall)                    │
+│    ├─ Add tool efficiency rewards                              │
+│    └─ Assign reward to each step (discounted)                  │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 6. PPO UPDATE (Trainer)                                         │
+│    ├─ Collect batch of trajectories + rewards                  │
+│    ├─ Compute advantages (GAE)                                 │
+│    ├─ Run multiple PPO optimization epochs                     │
+│    ├─ Update model weights (increase prob of high reward)      │
+│    └─ Update value function                                    │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 7. EVALUATION & CHECKPOINTING                                   │
+│    ├─ Run evaluation on held-out set                           │
+│    ├─ Log metrics (rewards, F1, tool usage)                    │
+│    ├─ Save checkpoint every N steps                            │
+│    └─ Continue training or terminate                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Detailed Component Breakdown
+
+#### Dataset Building
+
+**Script:** `src/build_dataset.py`
+
+```bash
+uv run src/build_dataset.py --output ../data/
+```
+
+**What it does:**
+1. Loads SWE-bench_Lite dataset (300 instances)
+2. For each instance:
+   - Extracts files modified in the patch (ground truth)
+   - Extracts functions/modules modified (for module-level rewards)
+3. Splits into train (80%) and validation (20%)
+4. Saves as Parquet files
+
+**Output:**
+```
+data/
+├── train.parquet  # 240 training instances
+└── eval.parquet   # 60 validation instances
+```
+
+#### Repository Cloning
+
+**Utility:** `src/utils/instance.py:clone_instance()`
+
+```python
+def clone_instance(repo_name, commit_id, instance_id, workspace):
+    """
+    Clone repository at specific commit for an instance.
+
+    Args:
+        repo_name: e.g., "django/django"
+        commit_id: Git commit SHA
+        instance_id: Unique instance identifier
+        workspace: Path to clone into (e.g., /tmp/testbed/uuid/)
+
+    Returns:
+        (status, working_dir)
+    """
+    # Clone from GitHub
+    # Checkout specific commit
+    # Return path to repository
+```
+
+**Why clone per-instance?**
+- Each SWE-bench task targets a specific commit
+- Parallel training needs isolated workspaces
+- Prevents conflicts between concurrent trajectories
+
+---
+
