@@ -1398,3 +1398,934 @@ def main(cfg: DictConfig):
 
 ---
 
+## 12. Key Components Deep Dive
+
+### Component Interaction Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         TRAINING LOOP                            │
+│                                                                  │
+│  ┌──────────────┐                                               │
+│  │   Dataset    │────────┐                                      │
+│  │ (SWE-bench) │        │                                      │
+│  └──────────────┘        ▼                                      │
+│                   ┌──────────────┐                              │
+│  ┌──────────────┐ │  Generator   │ ┌──────────────┐           │
+│  │ Inference    │◀│ (CodeSearch) │▶│   Trainer    │           │
+│  │ Engine (vLLM)│ └──────────────┘ │    (PPO)     │           │
+│  └──────────────┘        │         └──────────────┘           │
+│         │                │                │                     │
+│         │                ▼                │                     │
+│         │        ┌──────────────┐         │                     │
+│         └───────▶│   Agent +    │         │                     │
+│                  │ Conversation │         │                     │
+│                  └──────────────┘         │                     │
+│                         │                 │                     │
+│                         ▼                 │                     │
+│                  ┌──────────────┐         │                     │
+│                  │ Environment  │         │                     │
+│                  │  (SWEGrepEnv)│         │                     │
+│                  └──────────────┘         │                     │
+│                         │                 │                     │
+│                         ▼                 │                     │
+│                  ┌──────────────┐         │                     │
+│                  │ Reward       │─────────┘                     │
+│                  │ Computation  │                               │
+│                  └──────────────┘                               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 1. Generator (`CodeSearchGenerator`)
+
+**Location:** `src/generator/code_search_generator.py`
+
+**Responsibilities:**
+- Create and manage agent instances
+- Run conversations (trajectories)
+- Execute tool calls via environment
+- Compute rewards
+- Extract token IDs for PPO
+- Log metrics
+- Save trajectories to disk/GCS
+
+**Key Methods:**
+
+**`generate(input_batch)`** - Main entry point
+```python
+async def generate(self, input_batch: GeneratorInput) -> GeneratorOutput:
+    # Input: Batch of problems
+    # Output: Token IDs + rewards for PPO
+
+    for i in range(len(prompts)):
+        # Run one trajectory
+        rollout = self.code_search_loop(
+            prompts[i],
+            env_extras[i],
+            trajectory_id=trajectory_ids[i],
+            ...
+        )
+
+    # Aggregate results
+    return GeneratorOutput(
+        response_ids=responses,
+        rewards=rewards,
+        prompt_token_ids=prompts,
+        ...
+    )
+```
+
+**`code_search_loop()`** - Single trajectory
+```python
+async def code_search_loop(self, prompt, env_extras, ...):
+    # 1. Clone repository
+    workspace = Path(f"/tmp/testbed/{uuid_str}/")
+    clone_instance(repo_name, commit_id, workspace)
+
+    # 2. Create agent
+    agent = CustomAgent(llm=LLM(...), tools=[TerminalTool])
+    conversation = Conversation(agent=agent, workspace=working_dir)
+
+    # 3. Run agent
+    conversation.send_message(problem_statement)
+    conversation.run()
+
+    # 4. Extract results
+    messages = conversation.state.events
+    final_message = get_agent_final_response(messages)
+
+    # 5. Compute reward
+    for reward_fn_args in self.generator_cfg.reward:
+        reward_fn = get_reward_function(reward_fn_args["fn"])
+        reward_value = reward_fn(final_message=final_message, messages=messages, ...)
+        reward += reward_value
+
+    # 6. Extract token IDs
+    token_messages = [msg for msg in messages if msg["kind"] == "TokenEvent"]
+    rollout_list = []
+    for idx, message in enumerate(token_messages):
+        step_reward = reward * gamma**(num_steps - idx - 1)
+        rollout_list.append((
+            message["response_token_ids"],
+            step_reward,
+            message["prompt_token_ids"],
+            ...
+        ))
+
+    # 7. Save trajectory
+    save_to_disk(rollout_list, trajectory_id, ...)
+
+    return rollout_list
+```
+
+### 2. Agent (`CustomAgent`)
+
+**Location:** `src/agent/agent.py`
+
+**Extends:** `openhands.sdk.Agent`
+
+**Key Customization: Reasoning Extraction**
+
+```python
+class CustomAgent(Agent):
+    def step(self, conversation, on_event, on_token=None):
+        # ... (prepare messages, call LLM)
+
+        # Extract reasoning from <think> tags (Qwen3 feature)
+        content = message.content[0].text
+        if "</think>" in content:
+            reasoning_content = content.split('</think>')[0].split('<think>')[-1]
+            content = content.split('</think>')[-1]
+            message.content[0].text = content
+            message.reasoning_content = reasoning_content
+
+        # Handle tool calls
+        if message.tool_calls:
+            for i, tool_call in enumerate(message.tool_calls):
+                action_event = self._get_action_event(
+                    tool_call,
+                    reasoning_content=message.reasoning_content if i == 0 else None
+                )
+                self._execute_actions(conversation, action_events, on_event)
+
+        # Emit token IDs (for RL training)
+        self._maybe_emit_vllm_tokens(llm_response, on_event)
+```
+
+**Why Reasoning Extraction?**
+- Qwen3 models can output reasoning in `<think>` tags
+- This separates reasoning from final response
+- Allows training on both reasoning and action generation
+
+### 3. Environment (`SWEGrepEnv`)
+
+**Location:** `swe_grep_oss_env.py`
+
+**Extends:** `verifiers.StatefulToolEnv`
+
+**Core Methods:**
+
+**`is_completed()`** - Check if episode should end
+```python
+async def is_completed(self, messages, state, **kwargs) -> bool:
+    # Three termination conditions:
+    # 1. Agent returns <files> tags
+    has_files_tag = "<files>" in last_message and "</files>" in last_message
+
+    # 2. Max turns reached (8 turns)
+    max_turns_reached = await self.max_turns_reached(state)
+
+    # 3. Context window exceeded
+    prompt_too_long = await self.prompt_too_long(state)
+
+    return has_files_tag or max_turns_reached or prompt_too_long
+```
+
+**`env_response()`** - Execute tools
+```python
+async def env_response(self, messages, state, **kwargs):
+    tool_calls = messages[-1].get("tool_calls", [])
+
+    for tool_call in tool_calls:
+        # Parse tool arguments
+        tool_name = tool_call["function"]["name"]
+        tool_args = json.loads(tool_call["function"]["arguments"])
+
+        # Inject repository path
+        if tool_name == "bash":
+            tool_args["cwd"] = get_instance_path(state["info"])
+
+        # Execute tool
+        tool_message = await self.call_tool(tool_name, tool_args, tool_call_id)
+        tool_messages.append(tool_message)
+
+    return tool_messages, state
+```
+
+### 4. Trainer (`CustomFullyAsyncRayPPOTrainer`)
+
+**Location:** `src/async_trainer.py`
+
+**Extends:** `skyrl_train.fully_async_trainer.FullyAsyncRayPPOTrainer`
+
+**What it does:**
+- Manages PPO training loop
+- Coordinates generator and policy
+- Computes advantages (GAE)
+- Runs optimization epochs
+- Saves checkpoints
+- Logs metrics
+
+**Async Training Benefits:**
+- Overlaps trajectory generation with policy updates
+- Doesn't wait for slow trajectories
+- Higher throughput (2-3x faster than sync)
+
+### 5. Metrics (`efficiency_metrics.py`, `trajectory_metrics.py`)
+
+**Location:** `src/metrics/`
+
+**Efficiency Metrics:**
+```python
+def compute_all_efficiency_metrics(messages, wall_clock_duration, ...):
+    token_events = [m for m in messages if m["kind"] == "TokenEvent"]
+    action_events = [m for m in messages if m["kind"] == "ActionEvent"]
+
+    return {
+        "num_turns": len(token_events),
+        "num_tool_calls": len(action_events),
+        "total_prompt_tokens": sum(len(m["prompt_token_ids"]) for m in token_events),
+        "total_response_tokens": sum(len(m["response_token_ids"]) for m in token_events),
+        "wall_clock_duration": wall_clock_duration,
+        "tokens_per_second": total_tokens / wall_clock_duration,
+        ...
+    }
+```
+
+**Trajectory Metrics:**
+```python
+def compute_trajectory_metrics(messages):
+    return {
+        "has_final_response": has_files_tag(messages),
+        "trajectory_length": len(messages),
+        "unique_tool_calls": len(set(tool_names)),
+        ...
+    }
+```
+
+---
+
+## 13. Running Experiments
+
+### Prerequisites
+
+**Hardware Requirements:**
+- **GPU**: 2x A100 (80GB) recommended for training
+  - Minimum: 1x A100 (40GB) for smaller experiments
+- **CPU**: 32+ cores
+- **RAM**: 512GB recommended
+- **Storage**: 1TB+ (for datasets, checkpoints, trajectories)
+
+**Software Requirements:**
+```bash
+# Python 3.13+
+python --version
+
+# CUDA 12.8 (for PyTorch + vLLM)
+nvcc --version
+
+# UV package manager
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### Step 1: Setup Environment
+
+```bash
+# Clone repository
+git clone https://github.com/All-Hands-AI/agentic-code-search-oss
+cd agentic-code-search-oss
+
+# Initialize submodules (OpenHands SDK)
+git submodule update --init --recursive
+
+# Install dependencies
+uv sync
+
+# Verify installation
+uv run python -c "import torch; print(torch.cuda.is_available())"
+```
+
+### Step 2: Build Dataset
+
+```bash
+# Create data directory
+mkdir -p data
+
+# Build training/validation split
+uv run src/build_dataset.py --output data/
+
+# Output:
+# data/train.parquet (240 instances)
+# data/eval.parquet (60 instances)
+```
+
+**What this does:**
+- Downloads SWE-bench_Lite dataset
+- Extracts ground truth files from patches
+- Splits 80/20 train/validation
+- Saves as Parquet for fast loading
+
+### Step 3: Clone Repositories (Optional)
+
+For faster training, pre-clone all repositories:
+
+```bash
+# Clone all SWE-bench repositories
+uv run scripts/clone_repos.py --output-dir ./swebench_repos
+
+# This creates:
+# swebench_repos/
+#   ├── django__django/
+#   ├── scikit-learn__scikit-learn/
+#   └── ... (all repos at specific commits)
+```
+
+**Why pre-clone?**
+- Avoids cloning during training (saves time)
+- More deterministic (no network issues)
+- Optional - training will clone on-demand if not present
+
+### Step 4: Run Training
+
+**Basic Training (Local):**
+
+```bash
+# Simple training run
+uv run src/train.py \
+    data.train_data="['data/train.parquet']" \
+    data.val_data="['data/eval.parquet']" \
+    trainer.policy.model.path=willcb/Qwen3-8B \
+    trainer.epochs=20 \
+    trainer.train_batch_size=4 \
+    generator.reward=configs/rewards/tool_use.yaml
+```
+
+**Full Training (Production):**
+
+```bash
+# Use the provided script
+bash scripts/run_training.sh -m willcb/Qwen3-8B -n 4 -d data
+```
+
+**Script Parameters:**
+- `-m MODEL` - Model name (e.g., `willcb/Qwen3-8B`)
+- `-n N_ROLLOUTS` - Rollouts per problem (default: 4)
+- `-d DATA_PATH` - Path to dataset directory (default: `data/swe_smith`)
+- `-s CKPT_PATH` - Checkpoint save directory (default: `ckpts/{model}`)
+
+**Key Training Parameters Explained:**
+
+```bash
+# Data
+data.train_data="['data/train.parquet']"  # Training data
+data.val_data="['data/eval.parquet']"     # Validation data
+
+# Model & LoRA
+trainer.policy.model.path=willcb/Qwen3-8B  # Base model
+trainer.policy.model.lora.rank=64          # LoRA rank
+trainer.policy.model.lora.alpha=512        # LoRA alpha
+
+# Training
+trainer.epochs=20                          # Total epochs
+trainer.train_batch_size=4                 # Batch size
+trainer.eval_batch_size=100                # Eval batch size
+trainer.policy.optimizer_config.lr=1e-6    # Learning rate
+
+# Generation
+generator.max_turns=20                     # Max agent turns
+generator.num_inference_engines=2          # Parallel inference
+generator.n_samples_per_prompt=4           # Rollouts per problem
+generator.gpu_memory_utilization=0.6       # vLLM memory usage
+
+# Checkpointing
+trainer.ckpt_interval=10                   # Save every 10 steps
+trainer.ckpt_path=ckpts/qwen3-8b           # Save directory
+```
+
+### Step 5: Monitor Training
+
+**Weights & Biases (Recommended):**
+
+```bash
+# Set up W&B
+export WANDB_API_KEY=your_key_here
+
+# Training will automatically log to W&B
+# View at: https://wandb.ai/your_username/code_search
+```
+
+**Metrics Logged:**
+- **Rewards**: F1 score, tool usage, turn efficiency
+- **Training**: Loss, gradient norms, learning rate
+- **Efficiency**: Tokens/sec, wall clock time
+- **Trajectory**: Num turns, tool calls, success rate
+
+**Local Logs:**
+
+```bash
+# Check training logs
+tail -f logs/*.out
+
+# View trajectories
+ls ckpts/qwen3-8b/trajectories/step_10/train/
+# Each file: instance_id_repetition.json
+```
+
+**Sample Trajectory File:**
+```json
+{
+  "instance_id": "django__django-12345",
+  "target": ["auth/login.py", "auth/password.py"],
+  "total_reward": 4.95,
+  "reward_dict": {
+    "tool_use_reward": 3.2,
+    "turn_efficiency": 1.0,
+    "multilevel_localization_f1_reward": 0.75
+  },
+  "parsed_final_message": "auth/login.py\nauth/password.py\nutils/helper.py",
+  "messages": [...],
+  "metrics_dict": {
+    "num_turns": 3,
+    "num_tool_calls": 9,
+    "wall_clock_duration": 12.5
+  }
+}
+```
+
+### Step 6: Evaluate Checkpoints
+
+```bash
+# Evaluate a specific checkpoint
+uv run vf-eval swe-grep-oss-env \
+    --model-path ckpts/qwen3-8b/checkpoint_50 \
+    --dataset-split test \
+    --output-dir eval_results/
+
+# View results
+cat eval_results/metrics.json
+```
+
+**Evaluation Metrics:**
+- **F1 Score** - Primary metric (precision & recall)
+- **Precision** - % of predicted files that are correct
+- **Recall** - % of correct files that were found
+- **Latency** - Average time to localize
+- **Tool Usage** - Avg tool calls per problem
+
+### Step 7: Deploy Model
+
+**Serve with vLLM:**
+
+```bash
+# Start vLLM server
+vllm serve ckpts/qwen3-8b/checkpoint_best \
+    --enable-auto-tool-choice \
+    --tool-call-parser hermes \
+    --port 8000
+
+# Test inference
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-8b",
+    "messages": [
+      {"role": "system", "content": "..."},
+      {"role": "user", "content": "Find files for login bug"}
+    ],
+    "tools": [{"type": "function", "function": {"name": "bash", ...}}]
+  }'
+```
+
+---
+
+## 14. Making Modifications
+
+### Adding a New Reward Function
+
+**1. Create reward file:** `src/rewards/my_reward.py`
+
+```python
+from src.rewards import reward
+
+@reward("my_reward")
+def my_reward(messages, final_message, instance, **kwargs) -> float:
+    """
+    Custom reward based on your criteria.
+
+    Args:
+        messages: List of all conversation events
+        final_message: Agent's final response
+        instance: Dataset instance with ground truth
+
+    Returns:
+        Reward value (float)
+    """
+    # Example: Reward based on number of unique commands used
+    action_events = [m for m in messages if m["kind"] == "ActionEvent"]
+    unique_commands = set()
+
+    for event in action_events:
+        command = event.get("args", {}).get("command", "")
+        # Extract command name (e.g., "rg" from "rg pattern")
+        cmd_name = command.split()[0] if command else ""
+        unique_commands.add(cmd_name)
+
+    # Reward diversity of search strategies
+    diversity_score = len(unique_commands) / 5.0  # Normalize by max expected
+    return min(diversity_score, 1.0)
+```
+
+**2. Create reward config:** `configs/rewards/my_config.yaml`
+
+```yaml
+reward:
+  - fn: my_reward
+  - fn: multilevel_localization_f1_reward
+```
+
+**3. Use in training:**
+
+```bash
+uv run src/train.py \
+    generator.reward=configs/rewards/my_config.yaml \
+    ...
+```
+
+### Modifying the System Prompt
+
+**Location:** `src/prompts/system_prompt.py` or `src/prompts/templates/system_prompt.j2`
+
+**Option 1: Hardcoded (Python)**
+
+Edit `src/prompts/system_prompt.py`:
+```python
+SYSTEM_PROMPT = """
+You are a code localization agent with ENHANCED CAPABILITIES.
+
+NEW DIRECTIVE:
+- Use semantic search to find related code
+- Consider file dependencies and imports
+- ... (your modifications)
+"""
+```
+
+**Option 2: Template (Jinja2)**
+
+Edit `src/prompts/templates/system_prompt.j2`:
+```jinja2
+You are a specialized code localization agent.
+
+Your objective is to {{ objective }}.
+
+## TOOL USAGE
+{% if enable_parallel %}
+- Use parallel tool calls (up to {{ max_parallel }})
+{% endif %}
+...
+```
+
+Then pass variables in code:
+```python
+system_prompt_filename="prompts/templates/system_prompt.j2"
+# OpenHands will render with context
+```
+
+### Adding a New Tool
+
+**1. Define tool function:** `src/tools/my_tool.py`
+
+```python
+def semantic_search(query: str, top_k: int = 5, cwd: str = None) -> str:
+    """
+    Search codebase using semantic similarity.
+
+    Args:
+        query: Natural language query
+        top_k: Number of results to return
+        cwd: Working directory (injected by environment)
+
+    Returns:
+        Search results as formatted string
+    """
+    # Implementation using embeddings, vector DB, etc.
+    # ...
+    return results
+```
+
+**2. Register tool in environment:**
+
+Edit `swe_grep_oss_env.py`:
+```python
+import src.tools as tools
+
+class SWEGrepEnv(StatefulToolEnv):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.add_tool(tools.bash, args_to_skip=["cwd"])
+        self.add_tool(tools.semantic_search, args_to_skip=["cwd"])  # Add new tool
+```
+
+**3. Update system prompt** to teach agent about new tool:
+```
+## TOOLS AVAILABLE
+- bash: Execute shell commands (rg, grep, find, etc.)
+- semantic_search: Find code using natural language queries
+```
+
+**4. Test:**
+```bash
+# Run single instance to verify tool works
+uv run tests/test_single_prompt.py --instance-id django__django-12345
+```
+
+### Changing Model
+
+**Option 1: Different base model**
+
+```bash
+# Use different Qwen variant
+uv run src/train.py \
+    trainer.policy.model.path=Qwen/Qwen3-14B \
+    ...
+
+# Use different model family entirely
+uv run src/train.py \
+    trainer.policy.model.path=meta-llama/Llama-3.1-8B \
+    generator.engine_init_kwargs="{enable_auto_tool_choice:true,tool_call_parser:llama3}" \
+    ...
+```
+
+**Option 2: Different LoRA config**
+
+```bash
+# Larger LoRA rank (more parameters, slower)
+uv run src/train.py \
+    trainer.policy.model.lora.rank=128 \
+    trainer.policy.model.lora.alpha=1024 \
+    ...
+
+# Disable LoRA (full fine-tuning - requires more memory)
+uv run src/train.py \
+    trainer.policy.model.lora.enabled=false \
+    ...
+```
+
+### Adjusting Training Hyperparameters
+
+**Learning Rate:**
+```bash
+# Higher LR for faster convergence (risk of instability)
+trainer.policy.optimizer_config.lr=5e-6
+
+# Lower LR for more stable training
+trainer.policy.optimizer_config.lr=1e-7
+```
+
+**Batch Size:**
+```bash
+# Larger batch (more stable gradients, more memory)
+trainer.train_batch_size=8
+trainer.policy_mini_batch_size=8
+
+# Smaller batch (less memory, more updates)
+trainer.train_batch_size=2
+trainer.policy_mini_batch_size=2
+```
+
+**Generation Settings:**
+```bash
+# More rollouts per problem (better exploration, slower)
+generator.n_samples_per_prompt=8
+
+# Longer context window
+generator.max_input_length=32000
+trainer.max_prompt_length=8192
+
+# More turns (longer search, more thorough)
+generator.max_turns=30
+```
+
+### Debugging Tips
+
+**1. Test Single Instance:**
+
+```bash
+# Run agent on one problem
+uv run tests/test_single_prompt.py \
+    --instance-id django__django-12345 \
+    --model willcb/Qwen3-8B
+```
+
+**2. Check Tool Execution:**
+
+```bash
+# Test bash tool directly
+cd /path/to/repo
+rg "pattern" -t py  # Verify command works
+
+# Check tool output parsing
+uv run tests/test_messages.py
+```
+
+**3. Validate Rewards:**
+
+```bash
+# Test reward computation
+uv run tests/test_file_localization.py
+
+# Check reward values
+python -c "
+from src.rewards import get_reward_function
+reward_fn = get_reward_function('tool_use_reward')
+print(reward_fn(messages=[...]))
+"
+```
+
+**4. Profile Performance:**
+
+```bash
+# Check GPU utilization
+watch -n 1 nvidia-smi
+
+# Profile inference
+uv run vllm benchmark \
+    --model willcb/Qwen3-8B \
+    --input-len 2048 \
+    --output-len 512
+```
+
+**5. Inspect Trajectories:**
+
+```bash
+# View saved trajectories
+cat ckpts/qwen3-8b/trajectories/step_10/train/django__django-12345_0.json | jq .
+
+# Count successful episodes
+grep -l '"total_reward"' ckpts/qwen3-8b/trajectories/step_10/train/*.json | wc -l
+```
+
+---
+
+## 15. Troubleshooting
+
+### Common Issues
+
+**Issue: Out of Memory (OOM)**
+
+```
+RuntimeError: CUDA out of memory
+```
+
+**Solutions:**
+```bash
+# Reduce GPU memory utilization
+generator.gpu_memory_utilization=0.4  # Default: 0.6
+
+# Smaller batch size
+trainer.train_batch_size=2
+trainer.micro_train_batch_size_per_gpu=1
+
+# Enable gradient checkpointing
+trainer.policy.model.gradient_checkpointing=true
+
+# Smaller LoRA rank
+trainer.policy.model.lora.rank=32  # Default: 64
+```
+
+**Issue: vLLM Tool Calling Errors**
+
+```
+Error: Tool call parsing failed
+```
+
+**Solutions:**
+```bash
+# Verify tool call parser matches model
+generator.engine_init_kwargs="{tool_call_parser:hermes}"  # For Qwen3
+
+# Check model supports tool calling
+vllm serve willcb/Qwen3-8B --enable-auto-tool-choice --tool-call-parser hermes
+
+# Test with simple tool call
+curl http://localhost:8000/v1/chat/completions -d '{"tools": [...]}'
+```
+
+**Issue: Slow Training**
+
+**Solutions:**
+```bash
+# Enable async training
+run_async_trainer=true
+
+# More inference engines
+generator.num_inference_engines=4  # Default: 2
+
+# Fewer rollouts per problem
+generator.n_samples_per_prompt=2  # Default: 4
+
+# Smaller eval batch (faster eval)
+trainer.eval_batch_size=50  # Default: 100
+```
+
+**Issue: Low Rewards**
+
+**Debugging:**
+```bash
+# Check individual reward components
+cat ckpts/.../trajectories/step_10/train/*.json | jq '.reward_dict'
+
+# Verify ground truth extraction
+python -c "
+from src.utils.parse_patch import parse_patch
+patch = '''diff --git a/file.py ...'''
+print(parse_patch(patch))
+"
+
+# Test agent on easy instances
+uv run tests/test_single_prompt.py --instance-id <easy_instance>
+```
+
+**Solutions:**
+```bash
+# Adjust reward composition
+# Edit configs/rewards/tool_use.yaml
+reward:
+  - fn: multilevel_localization_f1_reward
+  # Remove other rewards to focus on F1
+
+# Simplify task (fewer files)
+# Filter dataset to single-file changes
+
+# Better system prompt
+# Edit src/prompts/system_prompt.py with clearer instructions
+```
+
+### FAQ
+
+**Q: How long does training take?**
+
+A: On 2x A100 GPUs:
+- 150 steps with batch_size=4: ~6-8 hours
+- Full 20 epochs: ~48-72 hours
+
+**Q: How much does it cost?**
+
+A: Approximate costs (USD):
+- Cloud GPUs (2x A100): $6-10/hour
+- Full training run: $300-700
+- Dataset storage: ~$10/month
+
+**Q: Can I train on smaller GPUs?**
+
+A: Yes, with modifications:
+- **Single A100 40GB**: Reduce batch_size to 2, LoRA rank to 32
+- **V100 32GB**: Use smaller model (Qwen3-0.6B), batch_size=1
+- **Consumer GPUs (RTX 4090)**: Use QLoRA (4-bit quantization)
+
+**Q: How do I resume training?**
+
+```bash
+uv run src/train.py \
+    trainer.resume_mode=latest \
+    trainer.ckpt_path=ckpts/qwen3-8b
+```
+
+**Q: Can I use my own dataset?**
+
+Yes! Format as Parquet with columns:
+```python
+{
+    "instance_id": str,
+    "repo": str,
+    "base_commit": str,
+    "problem_statement": str,
+    "target": list[str],  # Ground truth files
+}
+```
+
+Then:
+```bash
+uv run src/train.py \
+    data.train_data="['my_data/train.parquet']" \
+    data.val_data="['my_data/val.parquet']"
+```
+
+---
+
+## Conclusion
+
+You now have a comprehensive understanding of the **Agentic Code Search OSS** project:
+
+- **What it does**: Trains specialized agents for code localization using RL
+- **How it works**: PPO training on SWE-bench with OpenHands agents
+- **Why it matters**: Faster, more accurate code search than general LLMs
+- **How to use it**: Run experiments, modify configs, add custom rewards
+- **How to extend it**: Add tools, change models, tune hyperparameters
+
+### Next Steps
+
+1. **Run your first experiment** - Start with `scripts/run_training.sh`
+2. **Analyze results** - Check W&B logs and trajectory files
+3. **Experiment** - Try different rewards, models, or prompts
+4. **Contribute** - Share findings in #agentic-code-search-oss Slack
+
+### Resources
+
+- **GitHub**: https://github.com/All-Hands-AI/agentic-code-search-oss
+- **Slack**: #agentic-code-search-oss (All-Hands-AI workspace)
+- **SWE-bench**: https://www.swebench.com/
+- **OpenHands SDK**: https://github.com/OpenHands/software-agent-sdk
+- **SkyRL**: https://github.com/NovaSky-AI/SkyRL
+- **vLLM**: https://docs.vllm.ai/
+
+**Happy experimenting!**
