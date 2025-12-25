@@ -813,3 +813,588 @@ def clone_instance(repo_name, commit_id, instance_id, workspace):
 
 ---
 
+## 9. Environment & Dataset
+
+### SWE-bench Dataset
+
+**What is SWE-bench?**
+- A benchmark of **real software engineering tasks** from GitHub
+- Each task is a bug/feature from an actual pull request
+- Includes problem statement + patch (ground truth solution)
+- **SWE-bench Lite** = 300 carefully curated instances
+
+**Dataset Structure:**
+```python
+{
+    "instance_id": "django__django-12345",
+    "repo": "django/django",
+    "base_commit": "abc123def456...",
+    "problem_statement": "The login form crashes when...",
+    "patch": "diff --git a/auth/login.py ...",
+    "test_patch": "diff --git a/tests/test_auth.py ..."
+}
+```
+
+**How Ground Truth is Extracted:**
+```python
+# From swe_grep_oss_env.py:194
+def transform_row(row):
+    return {
+        "prompt": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": row["problem_statement"]},
+        ],
+        "answer": json.dumps(parse_patch(row["patch"])),  # Files from patch
+    }
+```
+
+**`parse_patch()` Function:**
+```python
+# From src/utils/parse_patch.py
+def parse_patch(patch_string: str) -> list[str]:
+    """
+    Extract list of files modified in a git patch.
+
+    Example patch:
+    diff --git a/src/main.py b/src/main.py
+    --- a/src/main.py
+    +++ b/src/main.py
+    ...
+
+    Returns: ["src/main.py"]
+    """
+    # Uses regex to extract file paths from diff headers
+```
+
+### Environment Definition
+
+**Location:** `swe_grep_oss_env.py`
+
+```python
+from verifiers import StatefulToolEnv
+
+class SWEGrepEnv(StatefulToolEnv):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.add_tool(tools.bash, args_to_skip=["cwd"])
+
+    async def is_completed(self, messages, state, **kwargs) -> bool:
+        """
+        Episode ends when:
+        1. Agent returns <files> XML tags, OR
+        2. Max turns (8) reached, OR
+        3. Context window limit exceeded
+        """
+        max_turns_reached = await self.max_turns_reached(state)
+        prompt_too_long = await self.prompt_too_long(state)
+
+        # Check for <files> tag in last message
+        has_files_tag = False
+        if messages and len(messages) > 0:
+            last_message = messages[-1]
+            if last_message.get("role") == "assistant":
+                content = last_message.get("content", "")
+                if "<files>" in content and "</files>" in content:
+                    has_files_tag = True
+
+        return has_files_tag or max_turns_reached or prompt_too_long
+
+    async def env_response(self, messages, state, **kwargs):
+        """
+        Execute tool calls and return results.
+        """
+        tool_messages = []
+        tool_calls = messages[-1].get("tool_calls", [])
+        for tool_call in tool_calls:
+            tool_name = tool_call.get("function", {}).get("name", "")
+            tool_args = json.loads(tool_call.get("function", {}).get("arguments", ""))
+
+            # Inject repository path as working directory
+            if tool_name == "bash":
+                tool_args["cwd"] = get_instance_path(state["info"])
+
+            # Execute tool
+            tool_message = await self.call_tool(tool_name, tool_args, tool_call_id)
+            tool_messages.append(tool_message)
+
+        return tool_messages, state
+```
+
+**Key Design Decisions:**
+
+1. **Single Tool (Bash Only)**
+   - Simplifies the agent's decision space
+   - Bash is flexible enough for all search operations
+   - Aligns with human software engineering workflow
+
+2. **Completion via `<files>` Tags**
+   - Clear signal that agent is done
+   - Easy to parse final answer
+   - Prevents ambiguity
+
+3. **Repository Injection via `cwd`**
+   - Agent doesn't need to know repository path
+   - Tools automatically execute in correct directory
+   - Isolates different concurrent episodes
+
+### System Prompt
+
+**Location:** `src/prompts/system_prompt.py`
+
+The system prompt is **critical** - it defines the agent's behavior. Key directives:
+
+**Core Objective:**
+```
+You are a specialized code localization agent. Your sole objective is to
+identify and return the files in the codebase that are relevant to the
+user's query.
+```
+
+**Tool Usage:**
+```
+- You MUST use the bash tool to search and explore the codebase
+- Execute bash commands like: rg, grep, find, ls, cat, head, tail, sed
+- Use parallel tool calls: invoke bash tool up to 5 times concurrently
+- NEVER exceed 5 parallel tool calls per turn
+```
+
+**Critical Context Management:**
+```
+- NEVER read entire large files with `cat`
+- ALWAYS check file size first: `wc -l path/to/file.py`
+- For files > 100 lines, read in chunks:
+  * Use `sed -n '1,100p' file.py` to read lines 1-100
+  * Use `sed -n '101,200p' file.py` to read lines 101-200
+```
+
+**Output Format:**
+```
+<files>
+src/main.py
+src/utils/helper.py
+tests/test_main.py
+</files>
+```
+
+**Why This Matters:**
+- Teaches agent to use tools efficiently
+- Prevents context window overflow
+- Encourages parallel exploration
+- Provides clear success criteria
+
+---
+
+## 10. Reward System
+
+The reward system is **the heart of RL training** - it defines what the agent learns to optimize.
+
+### Reward Architecture
+
+**Design Pattern:** Modular, composable rewards via registry
+
+```python
+# configs/rewards/tool_use.yaml
+reward:
+  - fn: tool_use_reward               # Ratio of tool calls to turns
+  - fn: turn_efficiency               # Penalty for too many turns
+  - fn: multilevel_localization_f1_reward  # File localization accuracy
+```
+
+Each reward function is:
+- **Independent** - Can be tested and debugged separately
+- **Composable** - Multiple rewards can be combined
+- **Configurable** - Weights and parameters via YAML
+
+### Reward Registry Pattern
+
+**Location:** `src/rewards/__init__.py`
+
+```python
+REWARD_REGISTRY = {}
+
+def reward(name: str):
+    """Decorator to register a reward function."""
+    def decorator(func):
+        REWARD_REGISTRY[name] = func
+        return func
+    return decorator
+
+def get_reward_function(reward_name: str):
+    """Get a reward function by name."""
+    if reward_name not in REWARD_REGISTRY:
+        raise ValueError(f"Reward function '{reward_name}' not found")
+    return REWARD_REGISTRY[reward_name]
+
+# Auto-discover and import all reward modules
+_auto_load_rewards()
+```
+
+**Adding a New Reward:**
+
+1. Create file `src/rewards/my_reward.py`
+2. Import decorator and use it:
+```python
+from src.rewards import reward
+
+@reward("my_custom_reward")
+def my_custom_reward(messages, final_message, instance, **kwargs):
+    # Compute reward based on trajectory
+    return reward_value
+```
+
+3. Reference in config:
+```yaml
+reward:
+  - fn: my_custom_reward
+    args:
+      some_param: value
+```
+
+### Core Reward Functions
+
+#### 1. File Localization F1 Reward
+
+**Location:** `src/rewards/result_tool_f1.py` (used via multilevel wrapper)
+
+```python
+def multilevel_localization_f1_reward(final_message, instance, **kwargs):
+    """
+    F1 score for file localization.
+
+    Ground truth: Files extracted from patch
+    Predicted: Files extracted from agent's <files> tags
+    """
+    # Parse agent's response
+    predicted_files = extract_files_from_xml(final_message)
+
+    # Get ground truth from instance
+    ground_truth_files = instance["target"]
+
+    # Normalize paths (remove leading ./)
+    predicted = set(normalize_path(f) for f in predicted_files)
+    actual = set(normalize_path(f) for f in ground_truth_files)
+
+    # Compute F1
+    if len(predicted) == 0 and len(actual) == 0:
+        return 1.0  # Perfect if both empty
+    if len(predicted) == 0 or len(actual) == 0:
+        return 0.0  # Zero if one is empty
+
+    true_positives = len(predicted & actual)
+    precision = true_positives / len(predicted)
+    recall = true_positives / len(actual)
+
+    if precision + recall == 0:
+        return 0.0
+
+    f1 = 2 * (precision * recall) / (precision + recall)
+    return f1
+```
+
+**F1 Score Intuition:**
+- **Precision** = (Correct files found) / (Total files returned)
+  - High precision → Few false positives
+- **Recall** = (Correct files found) / (Total correct files)
+  - High recall → Few false negatives
+- **F1** = Harmonic mean of precision and recall
+  - Balances both metrics
+
+**Example:**
+```
+Ground truth: [auth/login.py, auth/password.py, auth/session.py]
+Agent predicts: [auth/login.py, auth/password.py, utils/helper.py]
+
+True positives: 2 (login.py, password.py)
+False positives: 1 (helper.py)
+False negatives: 1 (session.py)
+
+Precision = 2/3 = 0.67
+Recall = 2/3 = 0.67
+F1 = 2 * (0.67 * 0.67) / (0.67 + 0.67) = 0.67
+```
+
+#### 2. Tool Use Reward
+
+**Location:** `src/rewards/tool_use.py`
+
+```python
+@reward("tool_use_reward")
+def tool_use_reward(messages, **kwargs) -> float:
+    """
+    Encourage agent to use tools frequently.
+    Reward = (Number of tool calls) / (Number of turns)
+    """
+    token_messages = [msg for msg in messages if msg["kind"] == "TokenEvent"]
+    tool_messages = [msg for msg in messages if msg["kind"] == "ActionEvent"]
+
+    num_turns = len(token_messages)
+    num_tool_calls = len(tool_messages)
+
+    if num_turns == 0:
+        return 0.0
+
+    return num_tool_calls / num_turns
+```
+
+**Intuition:**
+- Agents should use tools actively (not just generate text)
+- Higher ratio → More exploration
+- Encourages parallel tool calling (5 tools in 1 turn → ratio of 5)
+
+**Example:**
+```
+Turn 1: Generate 3 tool calls → ratio = 3
+Turn 2: Generate 5 tool calls → ratio = 5
+Turn 3: Generate 2 tool calls → ratio = 2
+Average: (3 + 5 + 2) / 3 = 3.33
+```
+
+#### 3. Turn Efficiency Reward
+
+**Location:** `src/rewards/tool_use.py`
+
+```python
+@reward("turn_efficiency")
+def turn_efficiency(messages, max_turns=5, **kwargs) -> float:
+    """
+    Penalize agents for using too many turns.
+    Encourages solving tasks quickly.
+    """
+    token_messages = [msg for msg in messages if msg["kind"] == "TokenEvent"]
+    tool_messages = [msg for msg in messages if msg["kind"] == "ActionEvent"]
+
+    num_turns = len(token_messages)
+    num_tool_calls = len(tool_messages)
+
+    if num_turns <= 1:
+        return 0.0
+
+    if num_tool_calls > 1:
+        # Reward if within max_turns, penalize if exceeds
+        if num_turns <= max_turns:
+            return 1.0
+        else:
+            return max(0.0, 1.0 - (num_turns - max_turns) * 0.1)
+
+    return 0.0
+```
+
+**Intuition:**
+- Fewer turns → Faster localization → Lower latency
+- Penalty grows linearly after `max_turns`
+- Balances exploration (need tools) with efficiency (minimize turns)
+
+### Reward Combination
+
+**Location:** `src/generator/code_search_generator.py:246`
+
+```python
+reward = 0
+reward_dict = {}
+
+for reward_fn_args in self.generator_cfg.reward:
+    reward_fn = get_reward_function(reward_fn_args["fn"])
+    input_args = {
+        "final_message": final_message,
+        "messages": messages,
+        "instance": instance,
+        **reward_fn_args.get("args", {})
+    }
+
+    reward_value = reward_fn(**input_args)
+    reward += reward_value  # Simple sum
+    reward_dict[reward_fn_args["fn"]] = reward_value
+
+print(f"Reward details: {reward_dict}, Total reward: {reward}")
+```
+
+**Example Output:**
+```
+Reward details: {
+    'tool_use_reward': 3.2,
+    'turn_efficiency': 1.0,
+    'multilevel_localization_f1_reward': 0.75
+}, Total reward: 4.95
+```
+
+### Reward Discounting
+
+**Location:** `src/generator/code_search_generator.py:302`
+
+```python
+# Assign reward to each step with gamma discounting
+gamma = 0.9
+num_steps = len(token_messages)
+for idx, message in enumerate(token_messages):
+    step_reward = reward * gamma**(num_steps - idx - 1)
+    rollout_list.append((response_ids, step_reward, ...))
+```
+
+**Why Discount?**
+- **Credit assignment** - Later steps get higher reward (closer to outcome)
+- **Temporal structure** - Earlier actions have less direct impact
+- **Standard RL practice** - gamma ∈ [0, 1]
+
+**Example:**
+```
+Total reward: 5.0
+3 steps in trajectory
+gamma = 0.9
+
+Step 0 reward: 5.0 * 0.9^(3-0-1) = 5.0 * 0.9^2 = 5.0 * 0.81 = 4.05
+Step 1 reward: 5.0 * 0.9^(3-1-1) = 5.0 * 0.9^1 = 5.0 * 0.9 = 4.5
+Step 2 reward: 5.0 * 0.9^(3-2-1) = 5.0 * 0.9^0 = 5.0 * 1 = 5.0
+```
+
+---
+
+## 11. Configuration System
+
+### Hydra + OmegaConf
+
+This project uses **Hydra** for hierarchical configuration management.
+
+**Why Hydra?**
+- **Composition** - Combine multiple config files
+- **Overrides** - Change parameters from command line
+- **Type safety** - Structured configs with validation
+- **Sweeps** - Run multiple experiments with different configs
+
+### Configuration Files
+
+#### 1. Training Config
+
+**Location:** `configs/swe-grep-oss/rl/train.toml`
+
+```toml
+max_steps = 150  # Total training steps
+
+[model]
+name = "willcb/Qwen3-8B"
+
+[model.ac]
+freq = 1  # Actor-critic update frequency
+
+[model.experimental.lora]
+rank = 64  # LoRA rank (higher = more parameters)
+alpha = 512  # LoRA scaling factor
+dropout = 0.0
+target_modules = [
+    "q_proj",      # Attention projections
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",   # MLP projections
+    "up_proj",
+    "down_proj"
+]
+
+[optim]
+lr = 1e-5  # Learning rate
+
+[ckpt]
+interval = 10  # Save checkpoint every 10 steps
+```
+
+**LoRA Explained:**
+- **LoRA (Low-Rank Adaptation)** - Efficient fine-tuning method
+- Instead of updating all 8B parameters, update small low-rank matrices
+- **rank = 64** → Only ~0.1% of parameters are trainable
+- **Faster training, less memory, prevents overfitting**
+
+**Target Modules:**
+- `q_proj, k_proj, v_proj, o_proj` - Attention mechanism
+- `gate_proj, up_proj, down_proj` - MLP (feedforward) layers
+- These are the most impactful layers for fine-tuning
+
+#### 2. Inference Config
+
+**Location:** `configs/swe-grep-oss/rl/infer.toml`
+
+```toml
+gpu_memory_utilization = 0.7  # Use 70% of GPU memory
+
+[model]
+name = "willcb/Qwen3-8B"
+enforce_eager = true  # Disable CUDA graphs (for debugging)
+enable_auto_tool_choice = true  # Enable tool calling
+tool_call_parser = "hermes"  # Parser for tool call format
+```
+
+**vLLM Parameters:**
+- `gpu_memory_utilization` - Controls memory allocation (higher = more throughput)
+- `enable_auto_tool_choice` - Model automatically generates tool calls
+- `tool_call_parser = "hermes"` - Qwen3 uses Hermes tool calling format
+
+#### 3. Reward Config
+
+**Location:** `configs/rewards/tool_use.yaml`
+
+```yaml
+reward:
+  - fn: tool_use_reward
+  - fn: turn_efficiency
+  - fn: multilevel_localization_f1_reward
+```
+
+**Simple, composable design:**
+- List of reward functions to apply
+- Functions are looked up in reward registry
+- Results are summed
+
+### Using Configurations
+
+**Training Script:** `scripts/run_training.sh`
+
+```bash
+uv run src/train.py \
+    generator=code_search_generator \
+    generator.reward=configs/rewards/tool_use.yaml \
+    trainer=ppo_trainer \
+    trainer.policy.model.path=willcb/Qwen3-8B \
+    trainer.policy.model.lora.rank=64 \
+    trainer.optimizer.lr=1e-5 \
+    trainer.epochs=20 \
+    generator.batch_size=4
+```
+
+**Hydra Override Syntax:**
+```bash
+# Override nested config
+trainer.policy.model.path=different/model
+
+# Override top-level
+trainer.epochs=50
+
+# Specify reward file
+generator.reward=configs/rewards/cosine.yaml
+```
+
+### Configuration Loading
+
+**Location:** `src/train.py:66`
+
+```python
+@hydra.main(config_path=config_dir, config_name="ppo_base_config")
+def main(cfg: DictConfig):
+    # Load reward config from YAML
+    if hasattr(cfg.generator, "reward"):
+        with open(cfg.generator.reward, "r") as f:
+            reward_cfg = OmegaConf.load(f)
+        cfg.generator.reward = reward_cfg.reward
+    else:
+        # Default reward
+        with open_dict(cfg):
+            cfg.generator.reward = [
+                {"fn": "multilevel_localization_f1_reward"},
+            ]
+```
+
+**Flow:**
+1. Hydra loads base config (`ppo_base_config.toml`)
+2. Applies overrides from command line
+3. Custom logic loads reward YAML and merges
+4. Final config passed to experiment
+
+---
+
