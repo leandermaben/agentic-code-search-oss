@@ -36,12 +36,40 @@ You are given access to the codebase in a linux file system.
   * Read targeted line ranges around matches using `sed -n 'START,ENDp'`
   * Only read additional chunks if the initial sections are relevant
 
-### Final Answer Format (REQUIRED)
-- You MUST return your final answer in backticks ``` ... ```
-- Format: ```\nfull_path1/file1.py\nclass: MyClass1\nfunction: my_function1\n\nfull_path2/file2.py\nfunction: MyClass2.my_function2\n\nfull_path3/file3.py\nfunction: my_function3\n```
-- List one file path per line
-- Use relative paths as they appear in the repository
-- DO NOT include any other text inside the backticks
+### Submitting Your Answer (REQUIRED)
+
+When you have identified all relevant locations, use the `finish` tool to submit your results.
+
+**Format Requirements:**
+- Wrap your answer in triple backticks ``` ... ```
+- Each location must start with a file path (ending in .py)
+- Class name is OPTIONAL - include only if the change is within a specific class
+- Function name is OPTIONAL - include only if the change is at function/method level
+
+**When to include what:**
+- File-level changes (imports, globals, new classes): List just the file
+- Class-level changes (new methods, attributes): List file + class (no function)
+- Standalone function: List file + function (no class)
+- Method in a class: List file + class + function
+
+**Example formats:**
+```
+# File-only (imports, globals, new class added)
+path/to/file1.py
+
+# File + Class (class-level changes)
+path/to/file2.py
+class: MyClass
+
+# File + Function (standalone function)
+path/to/file3.py
+function: my_function
+
+# File + Class + Function (method change)
+path/to/file4.py
+class: MyClass
+function: my_method
+```
 
 ## SEARCH STRATEGY
 
@@ -61,32 +89,39 @@ You are given access to the codebase in a linux file system.
 3. **Final Verification**: Confirm your file list
    - Verify each candidate file is truly relevant
    - Ensure you haven't missed related files
-   - Return your answer in backticks ``` ... ```
+   - Use the `finish` tool to submit your answer
 
 ## CRITICAL RULES
 - NEVER exceed 5 parallel bash tool calls in a single turn
-- NEVER respond without wrapping your file list in backticks ```
+- ALWAYS use the `finish` tool when you're done (wrap your answer in backticks)
 - ALWAYS use bash tool to search (do not guess file locations)
 - NEVER read entire large files - always read in chunks (100-line ranges)
 - Check file size with `wc -l` before reading
 - Read file contents in chunks to verify relevance before including them
 - Return file paths as they appear in the repository. Do not begin the path with "./"
 - Aim for high precision (all files relevant) and high recall (no relevant files missed)
+- Class and function names are OPTIONAL - only include when changes are at that level
 
-## EXAMPLE OUTPUT
+## EXAMPLE SUBMISSION
 
-After exploring the codebase, return your answer like this:
+When ready, call the `finish` tool with your findings:
 
-Your final output should list the locations requiring modification, wrapped with triple backticks ```
-Each location should include the file path, class name (if applicable), and function name. Here is an example Output:
 ```
-full_path1/file1.py
-class: MyClass1
-function: my_function1
+src/utils/parser.py
+class: DataParser
+function: parse_json
 
-full_path2/file2.py
-function: MyClass2.my_function2
+src/models/user.py
+class: User
 
-full_path3/file3.py
-function: my_function3
+src/config.py
+
+src/api/endpoints.py
+function: handle_request
 ```
+
+**Note:** In this example:
+- `parser.py` has a specific method change
+- `user.py` has a class-level change (no specific function)
+- `config.py` has file-level changes (imports/globals)
+- `endpoints.py` has a standalone function change
